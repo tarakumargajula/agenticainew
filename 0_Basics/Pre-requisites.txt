@@ -1,0 +1,11 @@
+Pre-requisites
+==============
+1. Download ollama on the local machine
+2. Download and install llama 3.2 inside ollama
+3. Create your project directory (c:\code\agenticai)
+4. pip install openai	 	pip install openai-agents
+5. Create an OpenAI API key and a Gemini API key
+6. Copy this API key and save it in a file called .env in the above directory
+
+OPENAI_API_KEY="paste your openai api key"
+GOOGLE_API_KEY=""
