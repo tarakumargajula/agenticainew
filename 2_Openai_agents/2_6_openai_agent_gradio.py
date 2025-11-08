@@ -13,7 +13,7 @@ load_dotenv(override=True)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # --- Database ---
-DB_PATH = "faqs.db"
+DB_PATH = "c://code//agenticai//2_openai_agents//faqs.db"
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 

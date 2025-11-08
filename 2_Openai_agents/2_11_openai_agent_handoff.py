@@ -1,56 +1,62 @@
+# customer_service_agents_handoff_fixed.py
+# pip install openai sentence-transformers python-dotenv pandas scikit-learn
+
 import os
-import pickle
 import numpy as np
+import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from openai import OpenAI
-from agents import Agent, Runner, function_tool
+from agents import Agent, Runner, function_tool, handoff
 import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import Any
 
 load_dotenv(override=True)
-
 client = OpenAI()
 
-# Paths
-EMBED_PATH = "c://code//agenticai//2_openai_agents//intent_embeddings.npy"
-META_PATH = "c://code//agenticai//2_openai_agents//intent_metadata.pkl"
+# -------------------------------------------------
+# Paths and model
+# -------------------------------------------------
+CSV_PATH = "c://code//agenticai//2_openai_agents//customer_service_training_data.csv"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-LOG_FILE = "agent_logs.txt"
+LOG_FILE = "c://code//agenticai//2_openai_agents//agent_logs.txt"
 
 model = SentenceTransformer(MODEL_NAME)
 
 # -------------------------------------------------
-# Load embeddings + metadata
+# Load data + create embeddings
 # -------------------------------------------------
-if not (os.path.exists(EMBED_PATH) and os.path.exists(META_PATH)):
-    raise FileNotFoundError("Missing embeddings or metadata. Run embedding script first.")
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"Training data not found at: {CSV_PATH}")
 
-print("Loading embeddings and metadata...")
-utterance_embeddings = np.load(EMBED_PATH)
+print("Loading training data and generating embeddings...")
+df = pd.read_csv(CSV_PATH)
 
-with open(META_PATH, "rb") as f:
-    meta = pickle.load(f)
-
-utterances = meta["utterances"]
-intents = meta["intents"]
-categories = meta["categories"]
+# Expect columns: flags, utterance, category, intent
+utterances = df["utterance"].astype(str).tolist()
+intents = df["intent"].astype(str).tolist()
+categories = df["category"].astype(str).tolist()
+utterance_embeddings = model.encode(utterances, convert_to_numpy=True)
 
 # -------------------------------------------------
-# Helper: Log issue
+# Logging utilities
 # -------------------------------------------------
 def log_issue(issue_type: str, query: str):
-    """Append a timestamped line to a shared log file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] New {issue_type} issue raised: {query}\n")
 
+def log_agent(agent_name: str, query: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] {agent_name} handled query: {query}\n")
+
 # -------------------------------------------------
-# Intent classifier using embeddings
+# Semantic intent classifier
 # -------------------------------------------------
 def classify_intent_semantic(user_query: str):
-    """Return top intent and category based on cosine similarity."""
     query_emb = model.encode([user_query], convert_to_numpy=True)
     similarities = cosine_similarity(query_emb, utterance_embeddings)[0]
     best_idx = int(np.argmax(similarities))
@@ -58,41 +64,41 @@ def classify_intent_semantic(user_query: str):
         "intent": intents[best_idx],
         "category": categories[best_idx],
         "matched_utterance": utterances[best_idx],
-        "similarity": round(float(similarities[best_idx]), 3)
+        "similarity": round(float(similarities[best_idx]), 3),
     }
 
 # -------------------------------------------------
-# Specialized agents (tools)
+# Specialized agent tools
 # -------------------------------------------------
 @function_tool
 async def handle_account(query: str):
-    """Handle account management queries."""
     log_issue("account", query)
-    return "Account Agent: assisting with account-related queries."
+    log_agent("Account Agent", query)
+    return "Your request to close or manage your account is being handled."
 
 @function_tool
 async def handle_order(query: str):
-    """Handle order or purchase queries."""
     log_issue("order", query)
-    return "Order Agent: handling purchase and order-related issues."
+    log_agent("Order Agent", query)
+    return "Your order-related request is being processed."
 
 @function_tool
 async def handle_delivery(query: str):
-    """Handle delivery or shipment queries."""
     log_issue("delivery", query)
-    return "Delivery Agent: tracking or resolving delivery issues."
+    log_agent("Delivery Agent", query)
+    return "Your delivery inquiry is being handled."
 
 @function_tool
 async def handle_feedback(query: str):
-    """Handle feedback, reviews, or complaints."""
     log_issue("feedback", query)
-    return "Feedback Agent: managing customer feedback and complaints."
+    log_agent("Feedback Agent", query)
+    return "Thank you for your feedback. It will be shared with the right team."
 
 @function_tool
 async def handle_payment(query: str):
-    """Handle payment, refund, or transaction-related queries."""
     log_issue("payment", query)
-    return "Payment Agent: processing payment and transaction issues."
+    log_agent("Payment Agent", query)
+    return "Your payment-related request is being handled."
 
 # -------------------------------------------------
 # Agent definitions
@@ -100,39 +106,47 @@ async def handle_payment(query: str):
 account_agent = Agent(
     name="Account Agent",
     instructions="Handle account management and profile issues.",
-    tools=[handle_account]
+    tools=[handle_account],
 )
 
 order_agent = Agent(
     name="Order Agent",
     instructions="Handle customer order and purchase issues.",
-    tools=[handle_order]
+    tools=[handle_order],
 )
 
 delivery_agent = Agent(
     name="Delivery Agent",
     instructions="Handle shipping and delivery inquiries.",
-    tools=[handle_delivery]
+    tools=[handle_delivery],
 )
 
 feedback_agent = Agent(
     name="Feedback Agent",
     instructions="Handle customer feedback, reviews, and complaints.",
-    tools=[handle_feedback]
+    tools=[handle_feedback],
 )
 
 payment_agent = Agent(
     name="Payment Agent",
     instructions="Handle billing, payments, and refunds.",
-    tools=[handle_payment]
+    tools=[handle_payment],
 )
 
+# Helper mapping for fallback routing
+AGENT_MAP = {
+    "account": account_agent,
+    "order": order_agent,
+    "delivery": delivery_agent,
+    "payment": payment_agent,
+    "feedback": feedback_agent,
+}
+
 # -------------------------------------------------
-# Triage logic (uses embeddings + LLM)
+# Triage tool using LLM + embeddings + handoff
 # -------------------------------------------------
 @function_tool
 async def triage_logic(query: str):
-    """Determine correct agent using embeddings + LLM reasoning."""
     result = classify_intent_semantic(query)
 
     route_prompt = f"""
@@ -143,7 +157,7 @@ async def triage_logic(query: str):
     Similarity: {result['similarity']}
 
     Which team should handle this — Account, Order, Delivery, Feedback, or Payment?
-    Reply with exactly one word.
+    Reply with exactly one word: Account, Order, Delivery, Feedback, or Payment.
     """
 
     llm_response = client.responses.create(
@@ -152,64 +166,122 @@ async def triage_logic(query: str):
         temperature=0
     )
 
-    route = llm_response.output[0].content[0].text.strip().lower()
+    try:
+        route_text = llm_response.output_text.strip().lower()
+    except AttributeError:
+        route_text = ""
+        for item in llm_response.output[0].content:
+            if hasattr(item, "text"):
+                route_text += item.text
+        route_text = route_text.strip().lower()
 
-    if "account" in route:
-        return "account"
-    elif "order" in route:
-        return "order"
-    elif "delivery" in route or "ship" in result["category"].lower():
-        return "delivery"
-    elif "feedback" in route or "review" in result["category"].lower():
-        return "feedback"
-    elif "payment" in route or "refund" in result["category"].lower():
-        return "payment"
+    # Prefer to return a handoff directive when we can detect a clear team
+    if "account" in route_text:
+        print("[Router] → Handoff to Account Agent")
+        return handoff(to=account_agent, input=query)
+    elif "order" in route_text:
+        print("[Router] → Handoff to Order Agent")
+        return handoff(to=order_agent, input=query)
+    elif "delivery" in route_text or "ship" in result["category"].lower():
+        print("[Router] → Handoff to Delivery Agent")
+        return handoff(to=delivery_agent, input=query)
+    elif "payment" in route_text or "refund" in result["category"].lower():
+        print("[Router] → Handoff to Payment Agent")
+        return handoff(to=payment_agent, input=query)
+    elif "feedback" in route_text or "review" in result["category"].lower():
+        print("[Router] → Handoff to Feedback Agent")
+        return handoff(to=feedback_agent, input=query)
     else:
-        return "feedback"  # fallback
+        # If the LLM didn't give a clear team, return a plain routing sentence (SDK may provide this).
+        # We keep it simple and return a user-facing sentence; the caller will fallback to embeddings.
+        return f"Could not determine exact team. Semantic category: {result['category']}"
 
 # -------------------------------------------------
-# Triage Agent
+# Triage Agent definition
 # -------------------------------------------------
 triage_agent = Agent(
     name="Triage Agent",
-    instructions="Determine which specialized agent should handle the query.",
+    instructions="Decide which specialized agent should handle a given customer query using handoff().",
     tools=[triage_logic],
+    handoffs=[account_agent, order_agent, delivery_agent, feedback_agent, payment_agent],
 )
 
 # -------------------------------------------------
-# Chat orchestration
+# Utility to examine possible SDK handoff structure
+# -------------------------------------------------
+def extract_handoff_from_result(result_obj: Any):
+    """
+    The SDK may return a dict-like handoff directive or an object. Detect common patterns:
+    - dict with 'handoff' key
+    - object with attribute 'handoff'
+    - fallback to None
+    """
+    if isinstance(result_obj, dict) and "handoff" in result_obj:
+        return result_obj["handoff"]
+    # try attribute-style
+    if hasattr(result_obj, "handoff"):
+        return getattr(result_obj, "handoff")
+    return None
+
+# -------------------------------------------------
+# Orchestration with robust handoff execution
 # -------------------------------------------------
 async def chat_with_customer(query: str):
-    """Run triage, select correct agent, and get response."""
-    triage_result_session = await Runner.run(triage_agent, query)
-    triage_result = triage_result_session.final_output.strip().lower()
+    # Run triage
+    triage_session = await Runner.run(triage_agent, query)
+    triage_result = triage_session.final_output
 
-    print(f"[Router] → Routed to: {triage_result.capitalize()} Agent")
+    # 1) If triage returned an SDK-style handoff directive, execute it
+    handoff_directive = extract_handoff_from_result(triage_result)
+    if handoff_directive:
+        # Expect directive to contain 'to' (Agent) and 'input' (text)
+        target_agent = None
+        input_text = query
+        # directive might be a dict or object; handle common shapes
+        if isinstance(handoff_directive, dict):
+            target_agent = handoff_directive.get("to") or handoff_directive.get("agent") or None
+            input_text = handoff_directive.get("input", query)
+        else:
+            # attribute access
+            target_agent = getattr(handoff_directive, "to", None) or getattr(handoff_directive, "agent", None)
+            input_text = getattr(handoff_directive, "input", query)
 
-    if triage_result == "account":
-        agent = account_agent
-    elif triage_result == "order":
-        agent = order_agent
-    elif triage_result == "delivery":
-        agent = delivery_agent
-    elif triage_result == "feedback":
-        agent = feedback_agent
-    elif triage_result == "payment":
-        agent = payment_agent
-    else:
-        agent = feedback_agent
+        if isinstance(target_agent, Agent):
+            print(f"[Router] → Executing {target_agent.name}")
+            response_session = await Runner.run(target_agent, input_text)
+            return response_session.final_output
+        # if the directive didn't contain an Agent object, continue to fallback routing
 
-    response_session = await Runner.run(agent, query)
+    # 2) If triage_result is plain text, try substring routing
+    if isinstance(triage_result, str):
+        triage_text = triage_result.strip().lower()
+        # Try to detect a team name mentioned in text
+        for key, agent in AGENT_MAP.items():
+            if key in triage_text:
+                print(f"[Router] → Routed to: {agent.name}")
+                response_session = await Runner.run(agent, query)
+                return response_session.final_output
+
+    # 3) Fallback to semantic classifier (guarantees we route somewhere)
+    sem = classify_intent_semantic(query)
+    cat = sem.get("category", "").lower()
+    for key, agent in AGENT_MAP.items():
+        if key in cat:
+            print(f"[Router] → Fallback routed to: {agent.name} (semantic category: {cat})")
+            response_session = await Runner.run(agent, query)
+            return response_session.final_output
+
+    # 4) Last-resort: feedback agent
+    print("[Router] → Fallback routed to: Feedback Agent")
+    response_session = await Runner.run(feedback_agent, query)
     return response_session.final_output
 
 # -------------------------------------------------
-# Chat loop
+# Interactive loop
 # -------------------------------------------------
 if __name__ == "__main__":
-
     async def main():
         print("Customer Service Chatbot (type 'exit' to quit)\n")
-
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in {"exit", "quit"}:
@@ -217,6 +289,11 @@ if __name__ == "__main__":
                 break
 
             response = await chat_with_customer(user_input)
-            print(f"Chatbot: {response}\n")
+            # response may be an object or string depending on Runner; convert to str
+            if hasattr(response, "output_text"):
+                output_text = response.output_text
+            else:
+                output_text = str(response)
+            print(f"Chatbot: {output_text}\n")
 
     asyncio.run(main())

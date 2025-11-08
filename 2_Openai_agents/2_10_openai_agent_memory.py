@@ -1,166 +1,134 @@
+import os
 import pandas as pd
-from collections import OrderedDict
-import sqlite3
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 from openai import OpenAI
-from agents import Agent, Runner, function_tool
-import asyncio
+from dotenv import load_dotenv
 
-load_dotenv(override=True)
-
-# ---------- Config ----------
-DB_PATH = "conversations.db"
-CSV_PATH = "c:\\code\\agenticai\\2_openai_agents\\Conversation.csv"
-MODEL = "gpt-4o-mini"
+# Configuration
+load_dotenv()
 client = OpenAI()
+MODEL = "gpt-4o-mini"
 
-# ---------- LRU Short-Term Memory ----------
-class LRUCache:
-    def __init__(self, max_size=500):
-        # OrderedDict is a dictionary that remembers the order of insertion
-        # Helps implement LRU
-        self.cache = OrderedDict()
-        self.max_size = max_size
+# Setup directories
+BASE_PATH = "c://code//agenticai//2_openai_agents//data/memory"
+SHORT_TERM_DIR = f"{BASE_PATH}/short_term"
+LONG_TERM_DIR = f"{BASE_PATH}/long_term"
 
-    def get(self, key): # get the value for a key
-        # print("In get function ", key)
-        if key in self.cache:
-            self.cache.move_to_end(key) # move the key to the end, since it was recently used
-            return self.cache[key]
-        return None
+# Initialize stores
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+short_term = Chroma(collection_name="short_term", embedding_function=embeddings, persist_directory=SHORT_TERM_DIR)
+long_term = Chroma(collection_name="long_term", embedding_function=embeddings, persist_directory=LONG_TERM_DIR)
 
-    def put(self, key, value):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        self.cache[key] = value
-        if len(self.cache) > self.max_size:
-            self.cache.popitem(last=False) # remove the least recently used item
-            
-    def contains(self, key): # check if the key is in the cache
-        return key in self.cache
+SHORT_TERM_HOURS = 2
 
-short_term_memory = LRUCache(max_size=500)
+# Core functions
+def add_memory(store, text):
+    meta = {"timestamp": datetime.now().isoformat()}
+    store.add_texts([text], metadatas=[meta])
 
-# ---------- DB Setup ----------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS faqs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        topic TEXT NOT NULL UNIQUE,
-        answer TEXT NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
+def search_memory(store, query, k=3):
+    try:
+        count = len(store._collection.get()["ids"])
+        if count == 0:
+            return []
+        return store.similarity_search_with_score(query, k=min(k, count))
+    except:
+        return []
 
-def load_csv_into_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM faqs")
-    rec_count = cursor.fetchone()[0]
-    if rec_count > 0:
-        print("Number of records in DB: ", rec_count)
-        conn.close()
-        return
+def cleanup_short_term():
+    try:
+        items = short_term._collection.get(include=["metadatas"])
+        now = datetime.now()
+        expired = []
+        
+        for idx, meta in enumerate(items.get("metadatas", [])):
+            if meta and "timestamp" in meta:
+                timestamp = datetime.fromisoformat(meta["timestamp"])
+                if (now - timestamp) >= timedelta(hours=SHORT_TERM_HOURS):
+                    expired.append(items["ids"][idx])
+        
+        if expired:
+            short_term._collection.delete(ids=expired)
+    except:
+        pass
 
-    df = pd.read_csv(CSV_PATH)
-    print("Loading CSV into DB and preloading short-term memory...")
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        topic = row["question"].strip()
-        answer = row["answer"].strip()
-
-        # Insert into long-term DB
-        try:
-            cursor.execute(
-                "INSERT INTO faqs (topic, answer) VALUES (?, ?)",
-                (topic, answer)
-            )
-        except sqlite3.IntegrityError:
-            continue
-
-        # Preload short-term memory with first 500 entries
-        if i < 500:
-            short_term_memory.put(topic, answer)
-
-    conn.commit()
-    conn.close()
-    print(f"Loaded {len(df)} entries into long-term memory.")
-    print(f"Preloaded {min(len(df), 500)} entries into short-term memory.")
-
-
-# ---------- FunctionTool for DB ----------
-@function_tool
-def query_faq_db(topic: str) -> str:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # print ("in query_faq_db ", topic)
-    cursor.execute("SELECT answer FROM faqs WHERE topic = ?", (topic,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else "Sorry, I cannot help you."
-
-# ---------- FunctionTool for Short-Term Memory ----------
-@function_tool
-def query_short_term_memory(topic: str) -> str:
-    result = short_term_memory.get(topic)
-    return result if result else "Sorry, I cannot help you."
-
-# ---------- Create Agent ----------
-agent = Agent(
-    model=MODEL,
-    tools=[query_faq_db, query_short_term_memory],
-    name="CustomerServiceAgent",
-    instructions=(
-        "You are a customer service agent. "
-        "You can only answer using short-term or long-term memory via the provided tools. "
-        "If the answer is not found, respond exactly with: 'Sorry, I cannot help you.'"
-    )
-)
-
-# runner = Runner.run(agent)
-
-# ---------- Async Wrapper ----------
-async def get_agent_response(user_query: str) -> str:
-    user_query = user_query.strip()
-    # print(user_query)
-
-    # Check short-term memory first
-    if short_term_memory.get(user_query):
-        # print("Found in STM")
-        return f"(short-term memory) {short_term_memory.get(user_query)}"
-
-    # Add empty placeholder
-    if not short_term_memory.contains(user_query):
-        # print("Not found in STM")
-        short_term_memory.put(user_query, "")
-
-    # Run agent
-    response = await Runner.run(agent, user_query)
-    answer = response.final_output.strip()
+def load_knowledge_base(csv_path="c://code//agenticai//2_openai_agents//Conversation.csv"):
+    try:
+        existing = len(long_term._collection.get()["ids"])
+        if existing > 0:
+            print(f"Knowledge base loaded: {existing} records\n")
+            return
+    except:
+        pass
     
-    # print("Answer:", answer)
+    df = pd.read_csv(csv_path)
+    for _, row in df.iterrows():
+        add_memory(long_term, f"Q: {row['question']}\nA: {row['answer']}")
+    print(f"Loaded {len(df)} records\n")
 
-    # Update short-term memory if an actual answer is returned
-    if answer != "Sorry, I cannot help you.":
-        short_term_memory.put(user_query, answer)
+def get_response(user_input):
+    cleanup_short_term()
+    
+    # Search both memories
+    recent = search_memory(short_term, user_input, k=2)
+    knowledge = search_memory(long_term, user_input, k=2)
+    
+    # Show what was found
+    print("\n" + "="*60)
+    if recent:
+        print("SHORT TERM:")
+        for doc, score in recent:
+            sim = max(0, (1 - (score ** 2) / 2) * 100)
+            print(f"  {sim:.1f}% - {doc.page_content[:80]}")
+    
+    if knowledge:
+        print("LONG TERM:")
+        for doc, score in knowledge:
+            sim = max(0, (1 - (score ** 2) / 2) * 100)
+            print(f"  {sim:.1f}% - {doc.page_content[:80]}")
+    print("="*60 + "\n")
+    
+    # Build context
+    context = "\n".join([doc.page_content for doc, _ in recent + knowledge])
+    
+    # Get AI response
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant. Use the context to answer."},
+            {"role": "user", "content": f"Context:\n{context}\n\nUser: {user_input}"}
+        ]
+    )
+    
+    answer = response.choices[0].message.content
+    
+    # Store conversation
+    conv = f"User: {user_input}\nBot: {answer}"
+    add_memory(short_term, conv)
+    
+    # Only save to long term if important words present
+    important_words = ["remember", "important", "always", "never", "policy", "how to"]
+    if any(word in user_input.lower() for word in important_words):
+        add_memory(long_term, conv)
+        print("Saved to long term memory\n")
+    
+    return answer
 
-    return f"(AI) {answer}"
-
-# ---------- Run ----------
-async def main():
-    init_db()
-    load_csv_into_db()
-    print("Agent Ready! Short + Long Term Memory. Type 'exit' to quit.\n")
-
+def main():
+    load_knowledge_base()
+    print("Chat ready. Type 'exit' to quit.\n")
+    
     while True:
-        user_input = input("You: ")
+        user_input = input("You: ").strip()
         if user_input.lower() in ["exit", "quit"]:
             break
-        answer = await get_agent_response(user_input)
-        print("Bot:", answer)
+        if not user_input:
+            continue
+        
+        answer = get_response(user_input)
+        print(f"Bot: {answer}\n")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
